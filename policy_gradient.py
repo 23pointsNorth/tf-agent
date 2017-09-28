@@ -1,14 +1,15 @@
 """ implements a simple policy gradient (actor critic technically) agent """
 
 import argparse
-import gym
 import time
-from gym.spaces import Discrete
 import numpy as np
 from scipy.signal import lfilter
 from scipy.misc import imsave, imresize
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
+import cv2
+
+import terrainEnv as te
 
 parser = argparse.ArgumentParser(description=None)
 parser.add_argument('-e', '--env', default='Breakout-v3', type=str, help='gym environment')
@@ -24,29 +25,34 @@ args = parser.parse_args()
 print(args)
 
 # -----------------------------------------------------------------------------
-def process_frame(frame):
-    """ Atari specific preprocessing, consistent with DeepMind """
-    reshaped_screen = frame.astype(np.float32).mean(2)      # grayscale
-    resized_screen = imresize(reshaped_screen, (84, 110)) # downsample
-    x = resized_screen[18:102, :]                           # crop top/bottom
-    x = imresize(x, (42, 42)).astype(np.float32)                             # downsample
-    x *= (1.0 / 255.0)                                      # place in [0,1]
-    x = np.reshape(x, [42, 42, 1])                          # introduce channel
-    return x
+# def process_frame(frame):
+#     """ Atari specific preprocessing, consistent with DeepMind """
+#     reshaped_screen = frame.astype(np.float32).mean(2)      # grayscale
+#     resized_screen = imresize(reshaped_screen, (84, 110)) # downsample
+#     x = resized_screen[18:102, :]                           # crop top/bottom
+#     x = imresize(x, (42, 42)).astype(np.float32)                             # downsample
+#     x *= (1.0 / 255.0)                                      # place in [0,1]
+#     x = np.reshape(x, [42, 42, 1])                          # introduce channel
+#     return x
 
 def policy_spec(x):
-  net = slim.conv2d(x, args.hidden_size, [5, 5], stride=2, padding='SAME', activation_fn=tf.nn.elu, scope='conv1')
-  net = slim.conv2d(net, args.hidden_size, [5, 5], stride=2, padding='SAME', activation_fn=tf.nn.elu, scope='conv2')
-  net = slim.flatten(net)
-  action_logits = slim.fully_connected(net, num_actions, activation_fn=None, scope='fc_act')
-  value_function = slim.fully_connected(net, 1, activation_fn=None, scope='fc_value')
+  # self.state_in= tf.placeholder(shape=[None,s_size],dtype=tf.float32)
+  # hidden = slim.fully_connected(self.state_in,h_size,biases_initializer=None,activation_fn=tf.nn.relu)
+  # self.output = slim.fully_connected(hidden,a_size,activation_fn=tf.nn.softmax,biases_initializer=None)
+  
+  net = slim.fully_connected(x, 32, activation_fn=tf.nn.elu, scope='fc1')
+  net = slim.fully_connected(net, 32, activation_fn=tf.nn.elu, scope='fc2')
+  # net = slim.flatten(net)
+  action_logits = slim.fully_connected(net, num_actions, activation_fn=tf.nn.softmax, scope='fc_act')
+  net_value = slim.fully_connected(net, 16, activation_fn=tf.nn.elu, scope='fc3_v')
+  value_function = slim.fully_connected(net_value, 1, activation_fn=None, scope='fc_value')
   return action_logits, value_function
 
 def rollout(n, max_steps_per_episode=4500):
   """ gather a single episode with current policy """
 
   observations, actions, rewards, discounted_rewards = [], [], [], []
-  ob = env.reset()
+  _, ob = env.reset()
   ep_steps = 0
   num_episodes = 0
   ep_start_pointer = 0
@@ -54,18 +60,20 @@ def rollout(n, max_steps_per_episode=4500):
   while True:
 
     # we concatenate the previous frame to get some motion information
-    obf_now = process_frame(ob)
-    obf_before = obf_now if prev_obf is None else prev_obf
-    obf = np.concatenate((obf_before, obf_now), axis=2)
+    # obf_now = process_frame(ob)
+    # obf_before = obf_now if prev_obf is None else prev_obf
+    # obf = np.concatenate((obf_before, obf_now), axis=2)
     #obf = obf_now - obf_before
-    prev_obf = obf_now
+    # prev_obf = obf_now
+    obf = ob
 
     # run the policy
     action = sess.run(action_index, feed_dict={x: np.expand_dims(obf, 0)}) # intro a batch dim
     action = action[0][0] # strip batch and #of samples from tf.multinomial
 
     # execute the action
-    ob, reward, done, info = env.step(action)
+    obs, reward, done, info = env.step(action)
+    _, ob = obs
     ep_steps += 1
 
     observations.append(obf)
@@ -73,12 +81,13 @@ def rollout(n, max_steps_per_episode=4500):
     rewards.append(reward)
 
     if done or ep_steps >= max_steps_per_episode:
+      cv2.imwrite('agent_path.png', env.render(viz=False))
       num_episodes += 1
       ep_steps = 0
       prev_obf = None
       discounted_rewards.append(discount(rewards[ep_start_pointer:], args.discount))
       ep_start_pointer = len(rewards)
-      ob = env.reset()
+      _, ob = env.reset()
       if len(rewards) >= n: break
 
   return np.stack(observations), np.stack(actions), np.stack(rewards), np.concatenate(discounted_rewards), {'num_episodes':num_episodes}
@@ -88,17 +97,17 @@ def discount(x, gamma):
 # -----------------------------------------------------------------------------
 
 # create the environment
-env = gym.make(args.env)
-num_actions = env.action_space.n
+env = te.TerrainEnv()
+num_actions = env.possible_actions
 
 # compile the model
-x = tf.placeholder(tf.float32, (None,) + (42,42,2), name='x')
+x = tf.placeholder(tf.float32, (None, 1), name='x')
 action_logits, value_function = policy_spec(x)
 action_index = tf.multinomial(action_logits - tf.reduce_max(action_logits, 1, keep_dims=True), 1) # take 1 sample
 # compile the loss: 1) the policy gradient
 sampled_actions = tf.placeholder(tf.int32, (None,), name='sampled_actions')
 discounted_reward = tf.placeholder(tf.float32, (None,), name='discounted_reward')
-pg_loss = tf.reduce_mean((discounted_reward - value_function) * tf.nn.sparse_softmax_cross_entropy_with_logits(action_logits, sampled_actions))
+pg_loss = tf.reduce_mean((discounted_reward - value_function) * tf.nn.sparse_softmax_cross_entropy_with_logits(logits=action_logits, labels=sampled_actions))
 # and 2) the baseline (value function) regression piece
 value_loss = args.value_scale * tf.reduce_mean(tf.square(discounted_reward - value_function))
 # and 3) entropy regularization
@@ -115,7 +124,7 @@ train_op = optimizer.apply_gradients(grads_and_vars)
 
 # tf init
 sess = tf.Session()
-sess.run(tf.initialize_all_variables())
+sess.run(tf.global_variables_initializer())
 n = 0
 mean_rewards = []
 while n <= args.max_steps: # loop forever
@@ -130,7 +139,7 @@ while n <= args.max_steps: # loop forever
 
   average_reward = np.sum(rewards)/info['num_episodes']
   mean_rewards.append(average_reward)
-  print('step %d: collected %d frames in %fs, mean episode reward = %f (%d eps), update in %fs' % \
+  print('step %d: collected %d frames in %.2fs, mean episode reward = %.2f (%d eps), update in %.2fs' % \
         (n, observations.shape[0], t1-t0, average_reward, info['num_episodes'], t2-t1))
 
 print(args)
